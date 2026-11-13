@@ -1,0 +1,53 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Denunciar - Desenrola</title>
+    <link rel="stylesheet" href="{% static 'css/denuncia.css' %}">
+</head>
+<body>
+    <nav class="topbar">
+        <a href="{% url 'meu_perfil' %}" class="btn-back">❮ Voltar</a>
+        <h1 class="page-title">Fazer denúncia</h1>
+        <div class="spacer"></div>
+    </nav>
+
+    <main class="container">
+        {% if messages %}
+            <div class="messages-container">
+                {% for message in messages %}
+                    <div class="alert-success">
+                        <span class="icon">✓</span>
+                        {{ message }}
+                    </div>
+                {% endfor %}
+            </div>
+        {% endif %}
+
+        <section class="card">
+            <div class="card-header">
+                <h2>Relatar um problema</h2>
+                <p>Ajude a manter a comunidade do Desenrola segura.</p>
+            </div>
+
+            <form method="POST" action="{% url 'reportar' %}">
+                {% csrf_token %}
+                
+                {{ form.non_field_errors }}
+                {% for field in form %}
+                <div class="input-group full-width">
+                    {{ field.label_tag }}{{ field }}{{ field.errors }}
+                </div>
+                {% endfor %}
+
+                <div class="form-actions">
+                    <button type="submit" class="btn-submit">Enviar denúncia</button>
+                </div>
+            </form>
+        </section>
+    </main>
+    {% include "_rodape.html" %}
+</body>
+</html>
