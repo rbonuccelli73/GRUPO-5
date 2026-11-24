@@ -3,9 +3,20 @@ from django.contrib.auth.hashers import make_password
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate, login, logout
-from .models import Usuario, Habilidade
+from .models import Usuario, Habilidade, Denuncia, EventoModeracao, Sessao
 from django.contrib import messages
-from .models import Denuncia
+from .recomendacoes import recomendar, normalizar, separar_habilidades
+from functools import wraps
+import re
+from django.core.exceptions import PermissionDenied
+from django.core.paginator import Paginator
+from django.db import transaction
+from django.http import HttpResponseBadRequest
+from django.views.decorators.http import require_POST
+from django.utils.http import url_has_allowed_host_and_scheme
+from .models import Favorito
+from .categorias import NOMES_DAS_CATEGORIAS, categoria_da_habilidade
+from django.db.models import Q
 
 
 # CADASTRO: salva um usuário novo no banco
@@ -218,10 +229,6 @@ def editar_perfil_view(request):
 def sessoes_view(request):
     return render(request, 'sessoes.html')
 
-from django.contrib.auth import logout
-from django.contrib.auth.decorators import login_required
-from django.shortcuts import render, redirect
-
 @login_required(login_url='login')
 def excluir_conta_view(request):
     erro = None
@@ -241,3 +248,242 @@ def excluir_conta_view(request):
 def sair_view(request):
     logout(request)
     return redirect('home')
+
+# RECOMENDAÇÕES: sugere pessoas para trocar habilidades com o usuário logado
+@login_required
+def recomendacoes(request):
+    # O login do Django e o Usuario do Desenrola compartilham o mesmo username
+    usuario = Usuario.objects.filter(user=request.user).first()
+
+    contexto = {"usuario": usuario}
+    if usuario is not None:
+        resultado = recomendar(usuario)
+        contexto.update(resultado)
+        contexto["total"] = sum(len(v) for v in resultado.values())
+    return render(request, "recomendacoes.html", contexto)
+
+@login_required(login_url='login')
+def lista_notificacoes(request):
+    notificacoes = request.user.notificacoes.all()
+    return render(request, "notificacoes.html", {"notificacoes": notificacoes})
+
+@login_required(login_url='login')
+def marcar_lida(request, pk):
+    request.user.notificacoes.filter(pk=pk).update(lida=True)
+    return redirect("notificacoes")
+
+@login_required(login_url='login')
+def marcar_todas_lidas(request):
+    request.user.notificacoes.filter(lida=False).update(lida=True)
+    return redirect("notificacoes")
+
+def moderador(view):
+    @login_required
+    @wraps(view)
+    def protegida(request, *args, **kwargs):
+        if not request.user.is_active or not request.user.is_staff:
+            raise PermissionDenied
+        return view(request, *args, **kwargs)
+    return protegida
+
+
+@moderador
+def painel(request):
+    status = request.GET.get('status', '')
+    denuncias = Denuncia.objects.select_related('usuario_alvo').prefetch_related('eventos__moderador').order_by('-data_registro', '-pk')
+    if status in dict(Denuncia.STATUS_CHOICES):
+        denuncias = denuncias.filter(status=status)
+    else:
+        status = ''
+    pagina = Paginator(denuncias, 20).get_page(request.GET.get('page'))
+    return render(request, 'painel.html', {'pagina': pagina, 'status': status, 'status_choices': Denuncia.STATUS_CHOICES})
+
+
+@moderador
+@require_POST
+@transaction.atomic
+def alterar_status(request, pk):
+    denuncia = get_object_or_404(Denuncia.objects.select_for_update(), pk=pk)
+    status = request.POST.get('status')
+    if status not in dict(Denuncia.STATUS_CHOICES):
+        return HttpResponseBadRequest('Status inválido.')
+    if denuncia.status != status:
+        anterior = denuncia.get_status_display()
+        denuncia.status = status
+        denuncia.save(update_fields=['status'])
+        EventoModeracao.objects.create(denuncia=denuncia, moderador=request.user, descricao=f'Status: {anterior} → {denuncia.get_status_display()}')
+    messages.success(request, 'Status atualizado.')
+    return redirect('moderacao_denuncias')
+
+
+@moderador
+@require_POST
+@transaction.atomic
+def remover_alvo(request, pk):
+    denuncia = get_object_or_404(Denuncia.objects.select_for_update(), pk=pk)
+    if request.POST.get('confirmar') != 'sim':
+        return HttpResponseBadRequest('Confirme a remoção.')
+    if denuncia.status == 'resolvida':
+        messages.error(request, 'Esta denúncia já foi resolvida.')
+        return redirect('moderacao_denuncias')
+    usuario = Usuario.objects.select_for_update().filter(pk=denuncia.usuario_alvo_id).first()
+    if usuario is None:
+        messages.error(request, 'Alvo sem vínculo ou já removido. Nenhum registro foi alterado.')
+        return redirect('moderacao_denuncias')
+    if denuncia.tipo == 'usuario':
+        login = User.objects.select_for_update().filter(username=usuario.username).first()
+        if login and (login.pk == request.user.pk or login.is_staff or login.is_superuser):
+            messages.error(request, 'Contas de moderação não podem ser removidas por este painel.')
+            return redirect('moderacao_denuncias')
+        descricao = f'Usuário @{usuario.username} removido.'
+        # O login e o perfil usam o mesmo username no cadastro existente.
+        if login:
+            login.delete()
+        usuario.delete()
+    elif denuncia.tipo == 'habilidade' and denuncia.habilidade_alvo:
+        chave = normalizar(denuncia.habilidade_alvo)
+        if chave not in separar_habilidades(usuario.habilidadeEnsina):
+            messages.error(request, 'A habilidade denunciada não está mais cadastrada para este usuário.')
+            return redirect('moderacao_denuncias')
+        partes = re.split(r'[,;/]', usuario.habilidadeEnsina)
+        usuario.habilidadeEnsina = ', '.join(parte.strip() for parte in partes if parte.strip() and normalizar(parte) != chave)
+        usuario.save(update_fields=['habilidadeEnsina'])
+        descricao = f'Habilidade {denuncia.habilidade_alvo} removida de @{usuario.username}.'
+    else:
+        return HttpResponseBadRequest('Alvo inválido.')
+    denuncia.status = 'resolvida'
+    denuncia.save(update_fields=['status'])
+    EventoModeracao.objects.create(denuncia=denuncia, moderador=request.user, descricao=descricao)
+    messages.success(request, descricao)
+    return redirect('moderacao_denuncias')
+
+# ---------- HABILIDADES FAVORITAS ----------
+
+def perfil_do_usuario(request):
+    """Devolve o Usuario do Desenrola ligado ao login (cria se ainda não existir)."""
+    usuario, _ = Usuario.objects.get_or_create(user=request.user, defaults={'nome': request.user.username})
+    return usuario
+
+
+@login_required(login_url='login')
+def lista_habilidades(request):
+    """Habilidades que as outras pessoas ensinam, com busca e filtro por categoria."""
+    usuario = perfil_do_usuario(request)
+    todas = list(Habilidade.objects.filter(tipo='ensinar')
+                 .exclude(usuario=usuario)
+                 .select_related('usuario')
+                 .order_by('nome', 'usuario__nome'))
+    favoritas = set(Favorito.objects.filter(usuario=usuario).values_list('habilidade_id', flat=True))
+
+    busca = request.GET.get('q', '').strip()
+    categoria = request.GET.get('categoria', '').strip()
+    if categoria not in NOMES_DAS_CATEGORIAS:
+        categoria = ''
+    termo = normalizar(busca)
+
+    habilidades = []
+    for habilidade in todas:
+        habilidade.categoria = categoria_da_habilidade(habilidade.nome)
+        habilidade.favorita = habilidade.pk in favoritas
+        if categoria and habilidade.categoria != categoria:
+            continue
+        if termo and termo not in normalizar(habilidade.nome) and termo not in normalizar(habilidade.usuario.nome):
+            continue
+        habilidades.append(habilidade)
+
+    return render(request, 'lista_habilidades.html', {
+        'habilidades': habilidades,
+        'existem_habilidades': bool(todas),
+        'busca': busca,
+        'categoria': categoria,
+        'categorias': NOMES_DAS_CATEGORIAS,
+    })
+
+
+@login_required(login_url='login')
+def habilidades_favoritas(request):
+    """Cards das habilidades salvas pelo usuário."""
+    usuario = perfil_do_usuario(request)
+    favoritos = list(Favorito.objects.filter(usuario=usuario).select_related('habilidade__usuario'))
+    for favorito in favoritos:
+        favorito.habilidade.categoria = categoria_da_habilidade(favorito.habilidade.nome)
+    return render(request, 'favoritas.html', {'favoritos': favoritos})
+
+
+@login_required(login_url='login')
+@require_POST
+def alternar_favorito(request, pk):
+    """Favorita a habilidade; se já era favorita, remove."""
+    usuario = perfil_do_usuario(request)
+    habilidade = get_object_or_404(Habilidade, pk=pk, tipo='ensinar')
+
+    if habilidade.usuario_id == usuario.pk:
+        messages.error(request, 'Você não pode favoritar a sua própria habilidade.')
+    else:
+        favorito, criado = Favorito.objects.get_or_create(usuario=usuario, habilidade=habilidade)
+        if criado:
+            messages.success(request, f'"{habilidade.nome}" foi para as suas favoritas.')
+        else:
+            favorito.delete()
+            messages.success(request, f'"{habilidade.nome}" foi removida das favoritas.')
+
+    destino = request.POST.get('next', '')
+    if not url_has_allowed_host_and_scheme(destino, allowed_hosts={request.get_host()}):
+        destino = 'lista_habilidades'
+    return redirect(destino)
+
+@login_required(login_url='login')
+def sessoes_view(request):
+    usuario_logado = request.user.usuario
+
+    if request.method == 'POST':
+        acao = request.POST.get('acao')
+
+        # 1. Criar nova sessão
+        if acao == 'criar':
+            convidado_id = request.POST.get('convidado_id')
+            habilidade = request.POST.get('habilidade')
+            data_hora = request.POST.get('data_hora')
+            formato = request.POST.get('formato')
+            local_ou_link = request.POST.get('local_ou_link', '')
+
+            convidado = get_object_or_404(Usuario, id=convidado_id)
+            Sessao.objects.create(
+                solicitante=usuario_logado,
+                convidado=convidado,
+                habilidade=habilidade,
+                data_hora=data_hora,
+                formato=formato,
+                local_ou_link=local_ou_link
+            )
+            return redirect('sessoes')
+
+        # 2. Atualizar status (confirmar, concluir ou cancelar)
+        sessao_id = request.POST.get('sessao_id')
+        sessao = get_object_or_404(
+            Sessao,
+            Q(solicitante=usuario_logado) | Q(convidado=usuario_logado),
+            id=sessao_id
+        )
+
+        if acao == 'confirmar' and sessao.convidado == usuario_logado:
+            sessao.status = 'confirmada'
+        elif acao == 'concluir':
+            sessao.status = 'concluida'
+        elif acao == 'cancelar':
+            sessao.status = 'cancelada'
+        
+        sessao.save()
+        return redirect('sessoes')
+
+    # Lista sessões do usuário e outros usuários disponíveis para agendamento
+    sessoes = Sessao.objects.filter(
+        Q(solicitante=usuario_logado) | Q(convidado=usuario_logado)
+    )
+    outros_usuarios = Usuario.objects.exclude(id=usuario_logado.id)
+
+    return render(request, 'sessoes.html', {
+        'sessoes': sessoes,
+        'usuario_logado': usuario_logado,
+        'outros_usuarios': outros_usuarios,
+    })
